@@ -160,9 +160,9 @@ aml.yaml (spec)
 
 ### Data Flow
 
-- `data/synthetic.py` generates deterministic test data with planted positives (C0001–C0009).
+- `data/synthetic.py` generates deterministic test data: 100 customers / ~1,311 txns by default (v0.1.16 re-base). Planted positives C0001–C0029 (per-spec typologies) plus a scale-up replica band on C0030–C0059 (the six core community-bank typologies; replica slots are stripped of incidental noise so each carries only its planted shape). Planted bands (C0001–C0059) are the **labelled** ground-truth positives (pin seed 42); the remaining customers are **unlabelled realistic background** — NOT a zero-alert guarantee. At the scaled volume some background activity coincidentally trips a tight rule shape even at seed 42 (by design — that's the realistic false-positive surface FP-analysis/tuning/backtest exist for; the engine never assumes planted-exclusivity). This is an intentional global re-base: the `≥60` guard gates only the replica band, while the new defaults + a universal ≥90-day onboarding floor apply to all calls (explicit-arg callers keep the same txn *count* but customer rows still re-base via the floor — fine, since determinism tests are self-consistency and no test pins exact onboarded_at).
 - `data/sources.py` resolves data sources: synthetic, CSV, Parquet, DuckDB, S3, GCS, Snowflake, BigQuery.
-- `data/input/` has sample CSVs (438 txns, 25 customers) for immediate testing.
+- `data/input/` has sample CSVs (1,311 txns, 100 customers) for immediate testing.
 
 ### Dashboard
 

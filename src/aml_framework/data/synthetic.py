@@ -224,20 +224,46 @@ def _customer_row(
 def generate_dataset(
     as_of: datetime,
     seed: int = 42,
-    n_customers: int = 30,
-    n_noise_txns: int = 400,
+    n_customers: int = 100,
+    n_noise_txns: int = 2000,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Produce ({customer rows, txn rows}) for the example spec's contracts."""
+    """Produce ({customer rows, txn rows}) for the example spec's contracts.
+
+    Ground-truth model: the planted bands (C0001-C0059) are the
+    **labelled** positives — deterministic typology shapes a caller
+    can treat as known ground truth (pin the canonical seed 42, which
+    every test, the dashboard demo, the committed ``data/input`` CSVs
+    and ``BacktestPeriod`` default use). The remaining customers are
+    **unlabelled realistic background** — NOT a guarantee of zero
+    alerts. With the v0.1.16 scaled volume, random background activity
+    will occasionally satisfy a tight rule shape (e.g. a coincidental
+    in→out within ``uk_app_fraud``'s 1h pass-through window) even at
+    seed 42. This is by design: real transaction monitoring produces
+    false positives, and surfacing them is exactly what the
+    framework's false-positive analysis / threshold-tuning / backtest
+    surfaces exist for — a synthetic set where only planted customers
+    ever alert would be less realistic, not more. The engine never
+    assumes planted-exclusivity (precision/recall is only scored when
+    the caller supplies its own ``labels_loader``).
+    """
     random.seed(seed)
     fake = Faker()
     Faker.seed(seed)
 
     customers: list[dict[str, Any]] = []
     customer_ids: list[str] = []
+    # Floor onboarding age at 90 days so NO customer is opened after
+    # their oldest possible txn (noise reaches as_of-59d, the dormant
+    # plant as_of-55d) — transactions predating account opening would
+    # fail any data-quality / audit check. Applied as a deterministic
+    # `max()` on the already-drawn value: it consumes no extra RNG, so
+    # txn counts + every hash stay on the v0.1.16 baseline.
+    _MIN_ONBOARD_AGE_DAYS = 90
     for i in range(n_customers):
         cid = f"C{i:04d}"
         customer_ids.append(cid)
-        customers.append(_customer_row(fake, cid, as_of - timedelta(days=random.randint(30, 1500))))
+        _onboard_age = max(random.randint(30, 1500), _MIN_ONBOARD_AGE_DAYS)
+        customers.append(_customer_row(fake, cid, as_of - timedelta(days=_onboard_age)))
 
     # Add edd_last_review dates to high-risk customers.
     for c in customers:
@@ -1230,6 +1256,169 @@ def generate_dataset(
             )
         )
         tid += 1
+
+    # ---------------------------------------------------------------------
+    # Scale-up positives (v0.1.16 re-base) — replicate the six always-on
+    # community-bank typologies onto a band of higher-index customers so
+    # the larger population keeps a realistic (still negative-majority)
+    # positive density instead of ~9 plants diluted across 100 accounts.
+    # ---------------------------------------------------------------------
+    # Self-contained + deterministic: uses only FIXED offsets (no
+    # `random.*`) so it does not perturb the seeded RNG order the noise
+    # / spec blocks above depend on, and is appended last so it can't
+    # shift any existing draw. Slots 30..59 are outside every spec
+    # contamination guard (C0012-C0029), so these plants are demo-safe
+    # for all jurisdictions. The `>= 60` guard only gates THIS replica
+    # block — it does NOT make small-n calls byte-identical to the
+    # pre-re-base output: the new n_customers/n_noise_txns defaults and
+    # the universal ≥90d onboarding floor are an intentional global
+    # re-base (user-approved). Callers that pin both n_customers and
+    # n_noise_txns keep the same txn COUNT (replica skipped, floor only
+    # shifts onboarding dates) but customer rows still re-base via the
+    # floor; this is fine — determinism tests are self-consistency and
+    # no test pins exact onboarded_at values.
+    _REPLICA_START = 30
+    _REPLICA_PER_TYPOLOGY = 5  # 6 typologies × 5 = 30 extra positive customers
+    _REPLICA_END = _REPLICA_START + 6 * _REPLICA_PER_TYPOLOGY  # exclusive (60)
+    if n_customers >= _REPLICA_END:
+        # Strip any prior noise / new-rail background rows that the
+        # seeded loops happened to assign to the replica slots, exactly
+        # as the spec plants do for their guarded IDs (e.g.
+        # `_rtp_boi_customer_ids`). Without this the random baseline on
+        # a replica raises its `unusual_volume_spike` floor and the
+        # planted surge no longer clears the rule — the scaled-positive
+        # ground truth would be inaccurate (only ~1 of 5 volume-spike
+        # clones would alert). Filtering the list consumes no RNG.
+        _replica_ids = {f"C{i:04d}" for i in range(_REPLICA_START, _REPLICA_END)}
+        txns = [t for t in txns if t["customer_id"] not in _replica_ids]
+        for r in range(_REPLICA_PER_TYPOLOGY):
+            s_idx = _REPLICA_START + r * 6  # structuring
+            m_idx = s_idx + 1  # rapid movement
+            j_idx = s_idx + 2  # high-risk jurisdiction
+            c_idx = s_idx + 3  # CTR large cash
+            v_idx = s_idx + 4  # unusual volume spike
+            d_idx = s_idx + 5  # dormant reactivation
+
+            # High-risk-jurisdiction replica needs the country/risk
+            # override the rule keys on (mirrors C0003).
+            customers[j_idx] = _customer_row(
+                fake,
+                customer_ids[j_idx],
+                as_of - timedelta(days=200),
+                country="RU",
+                risk_rating="high",
+                edd_last_review=as_of - timedelta(days=60),
+            )
+
+            # Structuring — sub-threshold cash-in (mirrors C0001).
+            for day_offset, amt in [(2, 9800), (5, 9500), (9, 9900), (14, 7500), (21, 9200)]:
+                txns.append(
+                    _make_txn(
+                        tid,
+                        customer_ids[s_idx],
+                        amt,
+                        as_of - timedelta(days=day_offset, hours=12),
+                        channel="cash",
+                        direction="in",
+                    )
+                )
+                tid += 1
+            # Rapid movement (mirrors C0002).
+            _rm_base = as_of - timedelta(days=3)
+            for i, (channel, direction, amt) in enumerate(
+                [
+                    ("cash", "in", 20000),
+                    ("cash", "in", 18000),
+                    ("wire", "out", 15000),
+                    ("wire", "out", 17500),
+                ]
+            ):
+                txns.append(
+                    _make_txn(
+                        tid,
+                        customer_ids[m_idx],
+                        amt,
+                        _rm_base + timedelta(hours=i * 6),
+                        channel=channel,
+                        direction=direction,
+                    )
+                )
+                tid += 1
+            # High-risk jurisdiction wires-in (mirrors C0003).
+            for day_offset, amt in [(5, 3500), (12, 4500), (18, 2800)]:
+                txns.append(
+                    _make_txn(
+                        tid,
+                        customer_ids[j_idx],
+                        amt,
+                        as_of - timedelta(days=day_offset, hours=10),
+                        channel="wire",
+                        direction="in",
+                    )
+                )
+                tid += 1
+            # CTR large same-day cash (mirrors C0004).
+            _ctr_day = as_of - timedelta(hours=18)
+            for hour_offset, amt in [(9, 6500), (14, 6000)]:
+                txns.append(
+                    _make_txn(
+                        tid,
+                        customer_ids[c_idx],
+                        amt,
+                        _ctr_day + timedelta(hours=hour_offset),
+                        channel="cash",
+                        direction="in",
+                    )
+                )
+                tid += 1
+            # Unusual volume spike (mirrors C0005).
+            for week in range(4):
+                txns.append(
+                    _make_txn(
+                        tid,
+                        customer_ids[v_idx],
+                        "200.00",
+                        as_of - timedelta(days=35 - week * 7, hours=11),
+                        channel="ach",
+                        direction="out",
+                    )
+                )
+                tid += 1
+            for day_offset, amt in [(1, 5000), (3, 4500), (5, 5500)]:
+                txns.append(
+                    _make_txn(
+                        tid,
+                        customer_ids[v_idx],
+                        amt,
+                        as_of - timedelta(days=day_offset, hours=15),
+                        channel="wire",
+                        direction="out",
+                    )
+                )
+                tid += 1
+            # Dormant reactivation (mirrors C0006).
+            txns.append(
+                _make_txn(
+                    tid,
+                    customer_ids[d_idx],
+                    "500.00",
+                    as_of - timedelta(days=55, hours=10),
+                    channel="ach",
+                    direction="out",
+                )
+            )
+            tid += 1
+            txns.append(
+                _make_txn(
+                    tid,
+                    customer_ids[d_idx],
+                    "15000.00",
+                    as_of - timedelta(days=2, hours=14),
+                    channel="wire",
+                    direction="in",
+                )
+            )
+            tid += 1
 
     # ---------------------------------------------------------------------
     # HS-code baseline reference table (trade_based_ml spec)
