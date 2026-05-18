@@ -215,3 +215,45 @@ class TestDataGridRuntime:
 
         assert st.session_state["selected_customer_id"] == "C-7"
         assert switched == ["pages/17_Customer_360.py"]
+
+    def test_data_grid_auto_height_sets_dom_layout_and_skips_pagination(self, monkeypatch):
+        fake_aggrid = _install_aggrid(monkeypatch, {"selected_rows": []})
+        st = SimpleNamespace(session_state={}, caption=lambda text: None)
+        mod = _reload_with_streamlit(monkeypatch, "aml_framework.dashboard.data_grid", st)
+
+        mod.data_grid(
+            FakeInputFrame(columns=["Contract", "Source"]),
+            key="rollup",
+            auto_height=True,
+        )
+
+        grid_options = fake_aggrid.last_call["kwargs"]["gridOptions"]
+        assert grid_options["domLayout"] == "autoHeight"
+        # autoHeight implies no pagination footer — that chrome is part
+        # of what the px estimate clipped on small tables.
+        kinds = [call[0] for call in FakeGridOptionsBuilder.last.calls]
+        assert "pagination" not in kinds
+        # Must also collapse AG Grid's default body min-height, else a
+        # 2-row table keeps a blank strip below the last row.
+        css = fake_aggrid.last_call["kwargs"]["custom_css"]
+        for sel in (
+            ".ag-center-cols-viewport",
+            ".ag-center-cols-clipper",
+            ".ag-center-cols-container",
+            ".ag-body-viewport",
+        ):
+            assert css[sel] == {"min-height": "unset !important"}, sel
+
+    def test_data_grid_default_is_fixed_height_and_paginated(self, monkeypatch):
+        fake_aggrid = _install_aggrid(monkeypatch, {"selected_rows": []})
+        st = SimpleNamespace(session_state={}, caption=lambda text: None)
+        mod = _reload_with_streamlit(monkeypatch, "aml_framework.dashboard.data_grid", st)
+
+        mod.data_grid(FakeInputFrame(columns=["a", "b"]), key="default")
+
+        grid_options = fake_aggrid.last_call["kwargs"]["gridOptions"]
+        assert "domLayout" not in grid_options
+        kinds = [call[0] for call in FakeGridOptionsBuilder.last.calls]
+        assert "pagination" in kinds
+        css = fake_aggrid.last_call["kwargs"]["custom_css"]
+        assert ".ag-center-cols-viewport" not in css
