@@ -158,7 +158,18 @@ def _do_llm_call(*, question: str, context: Any, backend_name: str, model: str |
     into a TemplateBackend reply here. The poller captures the
     exception into `_FAILED` so the operator sees the real error (the
     #311 contract: a failing ollama/openai backend must be visible,
-    not masked by canned scaffolding)."""
+    not masked by canned scaffolding).
+
+    NOTE on hung-backend timeouts: an in-process timeout layered here
+    can't reliably cancel a started call (Python threads aren't
+    killable) and bypassing the executor pool with an inner daemon
+    leaks workers under sustained backend hangs. The correct
+    enforcement point is the backends' own HTTP client (httpx /
+    requests `timeout=...`). The placeholder caption below
+    (`section_explainer`'s render path) tells the operator the wait
+    can take up to ~60s on a cold backend so a slow-but-progressing
+    call isn't perceived as stuck.
+    """
     return _call_backend(question=question, context=context, backend_name=backend_name, model=model)
 
 
@@ -565,7 +576,14 @@ def section_explainer(
 
             # Non-blocking placeholder. NOT `st.spinner` (that blocks
             # the script). The poller replaces this on the next rerun.
-            st.caption("⟳ Generating explanation…")
+            # Caption hints the wait window so a slow-but-progressing
+            # cold-backend call isn't perceived as stuck (user
+            # reported 2026-05-19). The underlying HTTP timeouts in
+            # the backends bound the worst case.
+            st.caption(
+                f"⟳ Generating explanation via `{backend_name}`… "
+                f"(can take ~30-60s on a cold backend)"
+            )
     except Exception as exc:  # noqa: BLE001
         # Don't break the page (the host section already rendered) but
         # surface the actual error so the operator can diagnose instead
@@ -633,6 +651,10 @@ def _promote_resolved() -> bool:
         try:
             reply = fut.result()
         except BaseException as exc:  # noqa: BLE001 — surface ALL failures
+            # Includes the TimeoutError raised by `_do_llm_call` when
+            # the inner worker thread exceeded `_TIMEOUT_SECONDS` —
+            # the operator sees the same st.error banner path as any
+            # other backend failure, distinguished by exception class.
             _FAILED[key] = exc
             _log_failure_to_audit(
                 exc,

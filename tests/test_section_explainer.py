@@ -1182,3 +1182,35 @@ def test_promote_resolved_skips_not_done_future(stub_st):
     assert mod._promote_resolved() is False
     assert key in mod._FUTURES  # untouched — still pending
     pending.cancel()
+
+
+def test_placeholder_caption_carries_backend_and_wait_hint(stub_st, monkeypatch):
+    """The non-blocking placeholder caption names the backend and the
+    expected wait window so an operator doesn't perceive a slow-but-
+    progressing cold-backend call as `Generating explanation` stuck
+    forever (user-reported 2026-05-19). The eventual real-error
+    surface still wins via `_FAILED` when the backend genuinely
+    fails — this is purely a UX cue while in-flight."""
+    from aml_framework.dashboard import section_explainer as mod
+
+    captions: list[str] = []
+    stub_st.caption = captions.append
+
+    monkeypatch.setenv("AML_AI_BACKEND", "ollama")
+    # Keep the worker pending — never resolve — so the placeholder
+    # render path fires (not the cached/failed branches).
+    fake_future = mock.MagicMock()
+    fake_future.done.return_value = False
+    monkeypatch.setattr(
+        mod, "_get_executor", lambda: mock.MagicMock(submit=lambda *a, **kw: fake_future)
+    )
+
+    mod.section_explainer(page="P", section_id="s", section_title="t", data_summary={"v": 1})
+
+    placeholder_lines = [c for c in captions if "Generating explanation" in c]
+    assert placeholder_lines, "placeholder caption never rendered"
+    line = placeholder_lines[-1]
+    assert "ollama" in line, "caption must name the backend so a misconfig is visible"
+    assert "30-60s" in line or "cold backend" in line, (
+        "caption must hint at the expected wait window so slow != stuck"
+    )
