@@ -94,9 +94,50 @@ data_grid(
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+
+def _scalar_amount(v):
+    """Extract a scalar number from an alert field that may be dict-shaped.
+
+    A python_ref ML scorer can emit `sum_amount` as
+    `{"value": X, "unit": "USD"}` style — pd.DataFrame keeps it as an
+    object cell which streamlit-aggrid JSON-ships verbatim to JS, where
+    `String({...})` becomes the user-reported `[object Object]`. And
+    the upstream KPI `float({...})` raises TypeError. Pull the nested
+    numeric (`value` / `amount` / `total`), else float-coerce a plain
+    scalar, else 0 — preserving the real magnitude (Codex P2 caught
+    the prior naive `to_numeric(...).fillna(0)` silently dropping
+    dict values to 0).
+    """
+    if isinstance(v, dict):
+        for k in ("value", "amount", "total"):
+            if k in v:
+                inner = v[k]
+                try:
+                    return float(inner) if inner not in (None, "") else 0
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+    try:
+        return float(v) if v not in (None, "") else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 # --- Per-model analysis ---
+_NORMALIZE_KEYS = ("sum_amount", "count")
+
+
 for rule in ml_rules:
-    alerts = result.alerts.get(rule.id, [])
+    # Normalize potentially-nested numeric fields ONCE, then both the
+    # KPI math and the grid render see the same scalar (don't mutate
+    # `result.alerts` — build a shallow-copied normalized list). Only
+    # touch keys that were PRESENT in the source alert: rules like
+    # `travel_rule_completeness` emit different shapes (no sum_amount)
+    # and fabricating zero columns would mislead reviewers (Codex P2).
+    alerts = [
+        {**a, **{k: _scalar_amount(a[k]) for k in _NORMALIZE_KEYS if k in a}}
+        for a in result.alerts.get(rule.id, [])
+    ]
     st.markdown(f"### {rule.id} — {rule.logic.model_id} v{rule.logic.model_version}")
 
     # KPIs for this model.
@@ -169,6 +210,9 @@ for rule in ml_rules:
 
     with col_right:
         # Feature breakdown (from alert data if available).
+        # `sum_amount` and `count` are already scalar-normalized by
+        # `_scalar_amount` at the top of the per-rule loop, so the grid
+        # sees plain numbers (no [object Object] from dict cells).
         st.markdown("#### Alert Details")
         alert_df = pd.DataFrame(alerts)
         show_cols = ["customer_id", "risk_score", "sum_amount", "count"]
