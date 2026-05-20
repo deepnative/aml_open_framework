@@ -84,7 +84,12 @@ data_grid(
     key="model_perf_inventory",
     severity_col="Severity" if "Severity" in _inventory_df.columns else None,
     pinned_left=["Model"] if "Model" in _inventory_df.columns else None,
-    height=min(35 * len(_inventory_df) + 60, 300),
+    # The model inventory is small (one row per ML rule), bounded by
+    # the spec. `auto_height` sizes the grid to its content so the
+    # last row isn't clipped by a px estimate that under-shoots
+    # AG Grid's real header+row+footer chrome (user-reported on
+    # 2026-05-19).
+    auto_height=True,
 )
 
 st.markdown("<br>", unsafe_allow_html=True)
@@ -180,7 +185,14 @@ for rule in ml_rules:
             gradient_high=0.85,
             gradient_invert=True,
             pinned_left=["customer_id"] if "customer_id" in available else None,
-            height=min(35 * len(alert_df) + 60, 320),
+            # Row-count gated: small N (≤10) gets auto_height so the
+            # last row isn't clipped by the px estimate's under-shoot
+            # of AG Grid's header+row+footer chrome (user-reported
+            # 2026-05-19). Larger N falls back to a fixed viewport so
+            # a python_ref rule emitting hundreds of alerts doesn't
+            # render an extremely tall page (Codex P2 #347).
+            auto_height=len(alert_df) <= 10,
+            height=420,
         )
 
     st.markdown("<br>", unsafe_allow_html=True)
