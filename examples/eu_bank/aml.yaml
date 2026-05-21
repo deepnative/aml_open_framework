@@ -27,6 +27,25 @@ data_contracts:
       # data sources that don't supply it; downstream purpose-code
       # rules degrade gracefully when the column is empty.
       - { name: purpose_code,       type: string,    nullable: true }
+      # PR-ML-3: Path B counterparty/debtor fields. Declared
+      # nullable so existing CSV/synthetic rows missing them still
+      # load. Path B (cross-signal amplification) activates when
+      # richer pacs.008 ingestion or BYOD data populates these.
+      # On the canonical seed-42 dataset they are sparse, so
+      # Path B's "all-to-same-known-counterparty" gate stays
+      # closed and C0010 fires Path A (the SQL-equivalent baseline)
+      # — the python_ref scorer's MRM-surfacing + score-distribution
+      # remain valuable even before Path B has firing data.
+      #
+      # `counterparty_account` is the framework's pacs.008
+      # parser's beneficiary identifier (different from
+      # `counterparty_id` which is the BYOD/CSV-style id). The
+      # scorer COALESCEs counterparty_id ← counterparty_account so
+      # both ingestion paths populate Path B's concentration gate
+      # (Codex round 5 + 6).
+      - { name: counterparty_id,      type: string,    nullable: true }
+      - { name: counterparty_account, type: string,    nullable: true }
+      - { name: debtor_country,       type: string,    nullable: true }
       - { name: counterparty_country, type: string,  nullable: true }
     quality_checks:
       - { not_null: [txn_id, customer_id, amount, booked_at] }
@@ -241,6 +260,38 @@ rules:
     tuning_grid:
       logic.having.count:      [{gte: 2}, {gte: 3}, {gte: 5}]
       logic.having.sum_amount: [{gte: 2500}, {gte: 5000}, {gte: 10000}]
+
+  # PR-ML-3: investment-scam amplifier (python_ref alongside the
+  # SQL aggregation_window above). Same baseline (≥3 outflows
+  # summing ≥$5k = Path A "snippet"), PLUS a lower-count cross-
+  # signal path (Path B) that catches the early pig-butchering
+  # shape: 2 outflows to a single offshore counterparty with
+  # foreign-destination dominance ≥80% — the FinCEN
+  # FIN-2023-Alert005 + FATF Cyber-Enabled Fraud (Feb 2026)
+  # "accelerating offshore single-beneficiary drain" pattern the
+  # SQL count-3 floor misses.
+  - id: investment_scam_scorer
+    name: Investment-scam amplifier (counterparty + foreign-dest + accel)
+    severity: high
+    regulation_refs:
+      - citation: "FATF Cyber-Enabled Fraud (Feb 2026)"
+        description: "Investment-scam typology — purpose-code INVS misuse."
+      - citation: "FinCEN FIN-2023-Alert005"
+        description: "Pig-butchering / relationship-investment scams."
+    logic:
+      type: python_ref
+      callable: aml_framework.models.investment_scam_scorer:investment_scam_scorer
+      model_id: investment_scam_v1
+      model_version: 2026-05-20
+    escalate_to: l2_investigator
+    evidence:
+      - matching_invs_transactions
+      - customer_kyc_profile
+      - beneficiary_lookup
+      - counterparty_concentration_report
+    tags: [iso20022, purpose_code, invs, pig_butchering, ml_governed]
+    model_tier: medium
+    validation_cadence_months: 18
 
 workflow:
   queues:
