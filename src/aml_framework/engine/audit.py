@@ -216,6 +216,10 @@ _FROZEN_SNAPSHOT_TARGETS = (
     # regulator can verify the alert→source-column map hasn't been
     # tampered with post-finalization.
     "field_lineage.jsonl",
+    # PR-LF1 (#383) — Pillar-6 SLA-monitor report. Frozen post-finalize
+    # so the breach inventory + batch-lateness signal can't be edited
+    # after the run is sealed (same posture as field_lineage / dq).
+    "sla_report.json",
 )
 
 
@@ -501,6 +505,13 @@ class AuditLedger:
         lineage_path = self.run_dir / "field_lineage.jsonl"
         field_lineage_hash = _sha256(lineage_path.read_bytes()) if lineage_path.exists() else None
 
+        # PR-LF1 (#383): same posture for `sla_report.json` — the Pillar-6
+        # breach inventory is regulator-facing evidence; without a manifest
+        # hash, a post-finalize edit (e.g. on Windows where chmod 0o444 is
+        # a no-op) would slip past tamper detection. Codex P2 on PR-LF1.
+        sla_path = self.run_dir / "sla_report.json"
+        sla_report_hash = _sha256(sla_path.read_bytes()) if sla_path.exists() else None
+
         manifest = {
             "engine_version": ENGINE_VERSION,
             "run_dir": str(self.run_dir),
@@ -512,6 +523,7 @@ class AuditLedger:
             "decisions_hash": decisions_hash,
             "dq_exceptions_hash": dq_exceptions_hash,
             "field_lineage_hash": field_lineage_hash,
+            "sla_report_hash": sla_report_hash,
             "finalised_at": datetime.now(tz=timezone.utc).isoformat(),
         }
         (self.run_dir / "manifest.json").write_bytes(
