@@ -16,6 +16,7 @@ import streamlit as st
 from aml_framework.dashboard.audience import show_audience_context
 from aml_framework.dashboard.components import (
     page_footer,
+    page_header,
     kpi_card_rag,
     link_to_page,
     section_explainer,
@@ -25,6 +26,19 @@ from aml_framework.dashboard.today import build_cards_for_audience
 from aml_framework.dashboard.state import ensure_initialized
 
 ensure_initialized()
+
+# PR-R30-D / #435 — invoke `page_header()` for the consistency contract
+# the other 52 pages obey. The visible title surface is the custom dna-
+# hero below (a deliberate marketing-style entrance, per the components.
+# py CSS comment), so we pass `render_chrome=False` to suppress the
+# generic eyebrow/H1/caption/divider and ONLY mount the required side
+# effects: AI assistant panel + section-explainer poller. Without this
+# call those affordances were silently absent from the Today surface.
+page_header(
+    "Today",
+    "Daily operations dashboard — overnight runs, open work queue, SLA breaches",
+    render_chrome=False,
+)
 
 audience = st.session_state.get("selected_audience")
 spec = st.session_state.spec
