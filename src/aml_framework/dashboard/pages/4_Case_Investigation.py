@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 from datetime import datetime, timezone
 from pathlib import Path as _Path
 
@@ -312,7 +313,59 @@ _w_left, _w_right = st.columns([1, 2])
 with _w_left:
     st.metric("Matched source rows", len(_matched_ids) if _matched_ids else 0)
     st.metric("Severity", str(case.get("severity", "—")))
-    st.metric("Rule version", (case.get("alert", {}).get("rule_version") or "—")[:16])
+    # PR-PAY-1: `_build_case` now stamps `rule_version` at the case
+    # level (same hash the audit ledger uses on `case_opened`
+    # decisions). Prefer that; fall back to the alert-level field
+    # for back-compat with case files written by older engine
+    # versions.
+    _rule_version = case.get("rule_version") or case.get("alert", {}).get("rule_version") or "—"
+    st.metric("Rule version", _rule_version[:16])
+    # PR-PAY-1: render the uniform `threshold` + `reference_data_version`
+    # metadata the engine stamps on every alert payload (Pillar 6 —
+    # alert lifecycle & explainability). `threshold` is a small JSON
+    # snapshot of the rule's active threshold (e.g. `{"having":
+    # {"count": {"gte": 3}}}` for aggregation_window;
+    # `{"match": "fuzzy", "threshold": 0.85}` for list_match);
+    # `reference_data_version` is the content-fingerprint of the
+    # reference list a list_match rule depended on (e.g.
+    # `"sanctions@a1b2c3d4e5f60718"`). Codex pass-5 P2: render an
+    # explicit "Not applicable — <reason>" state when the value is
+    # None for a current run, so investigators can tell "no schematic
+    # threshold for this rule shape" apart from "case file written
+    # before PR-PAY-1 and missing the key entirely".
+    _ref_version = _alert.get("reference_data_version")
+    if "reference_data_version" in _alert:
+        if _ref_version:
+            st.metric("Reference data", _ref_version)
+        else:
+            st.metric("Reference data", "n/a", help="Rule does not read a reference list.")
+    _threshold_snapshot = _alert.get("threshold")
+    if "threshold" in _alert:
+        st.caption("**Active threshold**")
+        if _threshold_snapshot is not None:
+            st.code(_json.dumps(_threshold_snapshot, indent=2, sort_keys=True), language="json")
+        else:
+            st.caption(
+                "_Not applicable — rule has no schematic threshold "
+                "(bespoke `custom_sql` or `python_ref`). Read "
+                "`rules/<rule_id>.sql` or the scorer's "
+                "`feature_attribution` for explainability._"
+            )
+
+    # PR-PAY-1 codex pass-6 P2: when a python_ref scorer attached a
+    # `feature_attribution` map and / or an `explanation` string (the
+    # `heuristic_risk_scorer` does this — see PR-EXPLAIN), surface them
+    # here so model-backed alerts have first-class explainability on
+    # the same panel. Without this, Pillar 6 COVERED would overstate
+    # what investigators actually see for python_ref rules.
+    _feature_attr = _alert.get("feature_attribution")
+    _explanation = _alert.get("explanation")
+    if _feature_attr or _explanation:
+        st.caption("**Scorer attribution**")
+        if isinstance(_explanation, str) and _explanation:
+            st.markdown(_explanation)
+        if isinstance(_feature_attr, dict) and _feature_attr:
+            st.code(_json.dumps(_feature_attr, indent=2, sort_keys=True), language="json")
 with _w_right:
     if _rule_sql.strip():
         with st.expander("Rule SQL (post-substitution, executed verbatim)", expanded=False):
