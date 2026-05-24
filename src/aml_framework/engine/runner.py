@@ -22,6 +22,7 @@ from aml_framework.engine.cost_volume import (
     summarise_tables,
     write_report as write_cost_volume_report,
 )
+from aml_framework.engine.defect_log import build_defect_log, derive_run_id, write_defect_log
 from aml_framework.engine.dq import DQException, evaluate_contract_checks
 from aml_framework.engine.entity_resolution import resolve_entities
 from aml_framework.engine.freshness import scan_contract_freshness
@@ -853,6 +854,32 @@ def _write_sla_report(run_dir: Path, report: SLAReport) -> None:
     path.write_bytes(json.dumps(payload, indent=2, sort_keys=True, default=str).encode("utf-8"))
 
 
+def _write_defect_log_snapshot(
+    ledger: AuditLedger,
+    *,
+    dq_exceptions: list[DQException],
+    python_ref_failures: dict[str, str],
+) -> None:
+    """Emit `defect_log.jsonl` from the current accumulator state.
+
+    Single canonical writer used by `run_spec`, the strict-mode
+    python_ref abort, and `_finalize_run`. Centralising the call
+    keeps the `derive_run_id` argument tuple (spec_content_hash,
+    as_of, input_manifest) in one place — codex pass-3 P2 on PR-C1.
+    """
+    defects = build_defect_log(
+        run_id=derive_run_id(
+            ledger.spec_content_hash,
+            ledger.as_of,
+            ledger.input_manifest,
+        ),
+        dq_exceptions=dq_exceptions,
+        python_ref_failures=python_ref_failures,
+        created_at=ledger.as_of,
+    )
+    write_defect_log(ledger.run_dir, defects)
+
+
 def _write_field_lineage(run_dir: Path, entries: list[FieldLineageEntry]) -> None:
     """Persist field lineage entries as one JSON object per line under the run dir.
 
@@ -981,6 +1008,21 @@ def run_spec(
             )
     _write_dq_exceptions(ledger.run_dir, dq_exceptions)
 
+    # PR-C1 (#371) codex pass-3 P2: write `defect_log.jsonl` HERE,
+    # immediately after `dq_exceptions.jsonl`, so the artifact lands
+    # on disk before any downstream abort (ContractViolation,
+    # DuckDB's NOT NULL constraint, an unexpected rule-execution
+    # exception). The one-ticket-per-DQ-exception contract holds
+    # across every abort path, not just the ones we explicitly
+    # wrapped. `_finalize_run` re-emits the file later with the full
+    # defect list including python_ref failures — idempotent for the
+    # happy path, additive for the rule-loop strict-abort path.
+    _write_defect_log_snapshot(
+        ledger,
+        dq_exceptions=dq_exceptions,
+        python_ref_failures={},
+    )
+
     # PR-A3 (#364) — field lineage is pure-spec derivation, so it can be
     # written any time after `run_dir` exists. Doing it here (before the
     # warehouse build) means an early ContractViolation that aborts the
@@ -1004,6 +1046,10 @@ def run_spec(
                 "detail": str(exc),
             }
         )
+        # PR-C1 (#371): the defect log was already written before
+        # `_build_warehouse`, so this re-raise leaves the artifact
+        # on disk regardless of which warehouse-build path failed
+        # (ContractViolation, DuckDB NOT NULL, etc.).
         raise
 
     # DATA-2 whitepaper claim: per-attribute freshness pinning. After
@@ -1105,7 +1151,24 @@ def run_spec(
                     }
                 )
                 python_ref_failures[rule.id] = error_msg
+                # PR-C1 (#371) codex pass-4 P2: re-emit the defect
+                # log every time a python_ref failure is recorded,
+                # not just on the strict-abort path. Under permissive
+                # mode (`AML_STRICT_PYTHON_REF=0`), a later rule
+                # (e.g. an invalid `custom_sql`) or finalize step
+                # might abort before `_finalize_run()` overwrites the
+                # snapshot. Re-emitting here keeps every recorded
+                # `rule_failed` event paired with a RULE_LOGIC defect
+                # on disk.
+                _write_defect_log_snapshot(
+                    ledger,
+                    dq_exceptions=dq_exceptions or [],
+                    python_ref_failures=python_ref_failures,
+                )
                 if _is_strict_python_ref(strict_python_ref):
+                    # Strict mode aborts before `_finalize_run()`;
+                    # the re-emit above already covered the artifact,
+                    # so just raise.
                     raise PythonRefFailure(
                         rule_id=rule.id,
                         module_path=module_path,
@@ -1343,6 +1406,17 @@ def _finalize_run(
         prior_run=prior_run,
     )
     write_monitoring_digest(ledger.run_dir, digest)
+
+    # PR-C1 (#371) — Pillar-2 defect log. Re-emit with the full
+    # accumulator state (DQ exceptions + permissive-mode python_ref
+    # failures); the snapshot written pre-warehouse already covered
+    # the abort paths. Written BEFORE `ledger.finalize()` so the
+    # manifest can pin `defect_log_hash`.
+    _write_defect_log_snapshot(
+        ledger,
+        dq_exceptions=dq_exceptions or [],
+        python_ref_failures=python_ref_failures or {},
+    )
 
     manifest = ledger.finalize()
     manifest["metrics"] = [m.to_dict() for m in metric_results]
