@@ -490,9 +490,496 @@ def build_audit_pack_from_run_dir(
     return build_audit_pack(spec, cases, decisions, jurisdiction=jurisdiction)
 
 
+# ---------------------------------------------------------------------------
+# PR-D4: per-case / per-batch evidence packs (closes #377)
+# ---------------------------------------------------------------------------
+#
+# The whole-run audit pack above is ~50 MB on a real bank's monthly run.
+# Investigators / regulators frequently want only the subset that pertains
+# to one case (or a handful of escalations). These two helpers carve out
+# the minimum set of artefacts needed to defend one alert: the case file
+# itself, the rule SQL that produced it, the alert payload, the per-case
+# decision sub-chain, lineage stamps, and the spec snapshot. Determinism
+# guarantees match the whole-run pack — same inputs → byte-identical ZIP
+# — and an optional `signing_key` attaches an HMAC-SHA256 over the
+# bundle hash to the manifest so the receiver can verify provenance.
+
+
+CASE_PACK_VERSION = "1"
+
+
+def _read_case_file(case_path: Path) -> dict[str, Any]:
+    if not case_path.exists():
+        raise FileNotFoundError(f"case file not found: {case_path}")
+    return json.loads(case_path.read_text(encoding="utf-8"))
+
+
+def _load_decisions(run_dir: Path) -> list[dict[str, Any]]:
+    decisions: list[dict[str, Any]] = []
+    dec_path = run_dir / "decisions.jsonl"
+    if dec_path.exists():
+        for line in dec_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                decisions.append(json.loads(line))
+    return decisions
+
+
+class _PiiMap:
+    """Field-aware PII mapping loaded from a run's ``pii_map.jsonl``.
+
+    Carries two views of the same sidecar so the masker can reason
+    about *context*:
+
+    - ``by_field``: ``field_name → {plaintext → hash}``. Used to only
+      mask a leaf when its parent dict key matches a recorded PII
+      field (Codex P2 — prevents short numeric plaintexts like ``"1"``
+      from rewriting unrelated leaves such as ``matched_row_ids: [1]``
+      or ``row_count: 1``).
+    - ``fields``: the set of all PII field names; cheap membership test.
+
+    Compound substring masking (``case_id``, ``source_path``) is still
+    done by iterating all known plaintexts, but with token-level guards
+    that prevent partial replacement of timestamps / non-PII path
+    components (see ``_mask_compound_string``).
+    """
+
+    __slots__ = ("by_field", "fields", "_all_plaintexts")
+
+    def __init__(self, by_field: dict[str, dict[str, str]]) -> None:
+        self.by_field: dict[str, dict[str, str]] = by_field
+        self.fields: frozenset[str] = frozenset(by_field.keys())
+        all_pt: dict[str, str] = {}
+        for mapping in by_field.values():
+            all_pt.update(mapping)
+        self._all_plaintexts: dict[str, str] = all_pt
+
+    def __bool__(self) -> bool:
+        return bool(self._all_plaintexts)
+
+    def lookup(self, field: str | None, value_str: str) -> str | None:
+        """Hash for ``value_str`` if the field is a known PII column."""
+        if field is None:
+            return None
+        col_map = self.by_field.get(field)
+        if not col_map:
+            return None
+        return col_map.get(value_str)
+
+    @property
+    def all_plaintexts(self) -> dict[str, str]:
+        return self._all_plaintexts
+
+
+class PiiMapCorruptError(ValueError):
+    """Raised when a run's ``pii_map.jsonl`` is malformed.
+
+    Fail-closed for regulator-facing evidence exports (Codex P2): a
+    corrupt masking sidecar must abort the pack build, not be silently
+    skipped — otherwise the requested case's customer_id could remain
+    unmasked in the ZIP while the manifest still advertises
+    ``pii_masked: true``.
+    """
+
+
+def _load_pii_map(run_dir: Path) -> _PiiMap:
+    """Load the run's ``pii_map.jsonl`` sidecar into a field-aware map.
+
+    The engine writes one row per ``(field, hash, plaintext)`` tuple
+    whenever PII masking is enabled (``AML_PII_MASKING=1`` + spec
+    columns flagged ``pii: true``). Granular packs use the field tag to
+    restrict masking to the right column so a numeric plaintext can't
+    rewrite unrelated audit evidence (Codex P2).
+
+    Raises ``PiiMapCorruptError`` when the sidecar exists but a row is
+    malformed (Codex P2): silent skip would let a granular pack ship
+    with plaintext PII for the corrupt row's case.
+    """
+    by_field: dict[str, dict[str, str]] = {}
+    sidecar = run_dir / "pii_map.jsonl"
+    if not sidecar.exists():
+        return _PiiMap(by_field)
+    for line_no, line in enumerate(sidecar.read_text(encoding="utf-8").splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise PiiMapCorruptError(f"{sidecar}: malformed JSON on line {line_no}: {exc}") from exc
+        plain = row.get("plaintext")
+        hashed = row.get("hash")
+        field = row.get("field")
+        if plain is None or hashed is None or field is None:
+            raise PiiMapCorruptError(
+                f"{sidecar}: missing required key (field/plaintext/hash) on line {line_no}"
+            )
+        by_field.setdefault(str(field), {})[str(plain)] = str(hashed)
+    return _PiiMap(by_field)
+
+
+def _mask_compound_string(value: str, pii_map: _PiiMap, *, key: str = "case_id") -> str:
+    """Token-level substring-mask of a compound engine identifier.
+
+    The engine builds compound strings whose components are joined by a
+    fixed delimiter — ``<rule>__<customer>__<window_end>`` for
+    ``case_id`` and ``<dir>/<customer>/<file>`` for ``source_path``.
+    Codex P2: a naive ``str.replace`` would rewrite *every* occurrence
+    of a short / numeric plaintext, mangling the non-PII timestamp /
+    rule_id components (e.g. ``rule__1__2026-01-15...`` → bad).
+
+    Fix: split on the appropriate delimiter and only swap whole tokens
+    that exactly equal a recorded plaintext. The hashes the engine
+    emits are opaque 16-hex strings that can never collide with any
+    rule_id, timestamp, or filename token, so token-level equality is
+    sufficient and never causes partial corruption.
+    """
+    if not pii_map or not value:
+        return value
+    if key == "source_path":
+        delimiter = "/"
+    else:
+        delimiter = "__"
+    parts = value.split(delimiter)
+    all_plaintexts = pii_map.all_plaintexts
+    masked_parts = [all_plaintexts.get(p, p) for p in parts]
+    return delimiter.join(masked_parts)
+
+
+_COMPOUND_ID_KEYS = frozenset({"case_id", "source_path"})
+"""Keys whose *values* are engine-built compound strings that may embed
+plaintext PII (``case_id`` = ``<rule>__<customer>__<ts>``,
+``source_path`` = ``data/<customer>/txn.csv``). Only these keys get
+substring masking — generic leaf strings stay on exact-value masking
+so a short PII value like ``1`` cannot accidentally rewrite timestamps,
+hashes, or other strings (Codex P2 fix)."""
+
+
+def _apply_pii_map(payload: Any, pii_map: _PiiMap, *, key: str | None = None) -> Any:
+    """Recursively replace plaintext values with their hashes.
+
+    Walks dicts/lists with **field awareness** (Codex P2): masking is
+    keyed to the parent dict key, so a numeric plaintext like ``"1"``
+    only rewrites values under the recorded PII field name (e.g.
+    ``customer_id``) and never collateral leaves like ``row_count: 1``
+    or ``matched_row_ids: [1]``.
+
+    Leaf rules:
+
+    - Leaf (string or scalar) under a recorded PII field whose
+      ``str()`` matches that field's plaintext → swap for hash.
+    - String leaf under ``_COMPOUND_ID_KEYS`` (``case_id`` /
+      ``source_path``) → token-level masking that swaps whole
+      delimited components matching a recorded plaintext.
+    - Anything else → returned as-is.
+    """
+    if not pii_map:
+        return payload
+    if isinstance(payload, dict):
+        return {k: _apply_pii_map(v, pii_map, key=k) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_apply_pii_map(v, pii_map, key=key) for v in payload]
+    if isinstance(payload, str):
+        # Field-keyed exact-match swap (handles PII columns directly).
+        hashed = pii_map.lookup(key, payload)
+        if hashed is not None:
+            return hashed
+        if key in _COMPOUND_ID_KEYS:
+            return _mask_compound_string(payload, pii_map, key=key)
+        # Network-pattern cases nest customer ids inside subgraph
+        # objects under generic keys like ``seed``, ``id``, ``source``,
+        # ``target``. Those keys are not PII field names, so the
+        # field-keyed lookup above misses them. Fall back to an
+        # all-fields exact-string lookup — safe for opaque PII
+        # identifiers and only applied to *string* leaves so a numeric
+        # plaintext "1" still cannot rewrite int leaves like
+        # ``row_count`` (Codex P1 follow-up).
+        all_pt_hash = pii_map.all_plaintexts.get(payload)
+        if all_pt_hash is not None:
+            return all_pt_hash
+        return payload
+    # Non-string leaf — coerce to str() and look up under the same
+    # field so a numeric/decimal/bool PII column gets hashed without
+    # accidentally rewriting unrelated numeric audit evidence.
+    coerced = str(payload)
+    hashed = pii_map.lookup(key, coerced)
+    if hashed is not None:
+        return hashed
+    return payload
+
+
+def _alerts_for_case(case: dict[str, Any], pii_map: dict[str, str]) -> list[dict[str, Any]]:
+    """Return the alert payload(s) attributable to *this* case.
+
+    Codex P2 / P1 fix: rather than mining ``alerts/<rule>.jsonl`` and
+    trying to identify which row produced this case (a join that's
+    ambiguous for network rules and for rules with multiple alerts per
+    customer with shared ``matched_row_ids``), we take the canonical
+    alert the engine stamped onto ``case["alert"]`` as the
+    single-source-of-truth. The case file is opened by the engine 1:1
+    with its triggering alert, so this is exactly the right row and no
+    sibling-case rows can ever leak in. PII masking is reapplied through
+    ``pii_map`` so the pack honours the run's masking contract.
+    """
+    alert = case.get("alert") or {}
+    if not alert:
+        return []
+    return [_apply_pii_map(alert, pii_map)]
+
+
+def _filter_decisions_for_cases(
+    decisions: list[dict[str, Any]], case_ids: set[str]
+) -> list[dict[str, Any]]:
+    return [d for d in decisions if d.get("case_id", "") in case_ids]
+
+
+def _read_optional(run_dir: Path, relative: str) -> bytes | None:
+    p = run_dir / relative
+    if p.exists() and p.is_file():
+        return p.read_bytes()
+    return None
+
+
+def _attach_signature(manifest: dict[str, Any], signing_key: str | None) -> None:
+    """Sign the manifest in-place when a key is supplied.
+
+    Uses HMAC-SHA256 over the canonical ``bundle_hash`` — same primitive
+    the engine uses to hash PII (`engine/audit.py`). Receivers verify by
+    re-running HMAC over the bundle_hash with the shared key.
+    """
+    if not signing_key:
+        return
+    import hmac
+
+    sig = hmac.new(
+        signing_key.encode("utf-8"),
+        manifest["bundle_hash"].encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    manifest["signature"] = {"algorithm": "HMAC-SHA256", "value": sig}
+
+
+def _assemble_pack(
+    files: dict[str, bytes],
+    manifest_base: dict[str, Any],
+    *,
+    signing_key: str | None,
+) -> bytes:
+    """Common tail: per-file hashes, bundle hash, manifest, deterministic ZIP."""
+    file_hashes = {
+        path: hashlib.sha256(payload).hexdigest() for path, payload in sorted(files.items())
+    }
+    bundle_hash = hashlib.sha256(
+        "\n".join(f"{p}:{h}" for p, h in sorted(file_hashes.items())).encode("utf-8")
+    ).hexdigest()
+    manifest = {**manifest_base, "files": file_hashes, "bundle_hash": bundle_hash}
+    _attach_signature(manifest, signing_key)
+    files["manifest.json"] = _dump_json(manifest)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(files.keys()):
+            info = zipfile.ZipInfo(filename=path, date_time=_ZIP_FIXED_TIME)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, files[path])
+    return buf.getvalue()
+
+
+def _case_pack_files(
+    spec: AMLSpec,
+    case: dict[str, Any],
+    run_dir: Path,
+    all_decisions: list[dict[str, Any]],
+    pii_map: dict[str, str],
+) -> dict[str, bytes]:
+    """Per-case file payloads — shared by single-case + batch packs.
+
+    ``pii_map`` (plaintext → hash from the run's ``pii_map.jsonl``) is
+    applied to the case dict, decision sub-chain, alert payload AND the
+    case_id-derived ZIP entry names + lineage identifiers before they
+    are written. PII embedded inside compound identifiers (e.g.
+    ``case_id`` = ``<rule>__<customer>__<ts>``) is substring-replaced.
+    Empty mapping (unmasked run) is a no-op.
+    """
+    raw_case_id = case.get("case_id", "")
+    masked_case_id = _mask_compound_string(raw_case_id, pii_map)
+    rule_id = case.get("rule_id", "")
+    # decisions are looked up by the engine-emitted raw case_id; mask
+    # them only on the way out.
+    decisions = _filter_decisions_for_cases(all_decisions, {raw_case_id})
+    alerts = _alerts_for_case(case, pii_map)
+    rule_sql = _read_optional(run_dir, f"rules/{rule_id}.sql")
+    # Codex P2: the engine stamps `rule_version` on the `case_opened`
+    # decision event, not on the alert payload, so prefer the alert
+    # but fall back to the decision sub-chain so packs built from real
+    # `aml run` output never record rule_version as null.
+    alert_dict = case.get("alert") or {}
+    rule_version = alert_dict.get("rule_version")
+    if rule_version is None:
+        for d in decisions:
+            if d.get("rule_version"):
+                rule_version = d["rule_version"]
+                break
+
+    # Codex P2 follow-up: source_path is now in _COMPOUND_ID_KEYS, so
+    # the recursive _apply_pii_map walk masks it everywhere it appears
+    # (lineage AND the embedded ``input_hash`` inside the case dict),
+    # and no per-field special-casing is needed here.
+    lineage_raw = {
+        "case_id": masked_case_id,
+        "rule_id": rule_id,
+        "rule_version": rule_version,
+        "matched_row_ids": alert_dict.get("matched_row_ids") or [],
+        "input_files": [
+            {
+                "contract_id": contract_id,
+                "row_count": meta.get("row_count"),
+                "content_hash": meta.get("content_hash"),
+                "source_path": meta.get("source_path"),
+                "schema_hash": meta.get("schema_hash"),
+            }
+            for contract_id, meta in sorted((case.get("input_hash") or {}).items())
+        ],
+    }
+    lineage = _apply_pii_map(lineage_raw, pii_map)
+    masked_case = _apply_pii_map(case, pii_map)
+    masked_decisions = [_apply_pii_map(d, pii_map) for d in decisions]
+    files: dict[str, bytes] = {
+        f"cases/{masked_case_id}.json": _dump_json(masked_case),
+        f"decisions/{masked_case_id}.jsonl": (
+            "\n".join(json.dumps(d, sort_keys=True) for d in masked_decisions)
+            + ("\n" if masked_decisions else "")
+        ).encode("utf-8"),
+        f"alerts/{masked_case_id}.jsonl": (
+            "\n".join(json.dumps(a, sort_keys=True) for a in alerts) + ("\n" if alerts else "")
+        ).encode("utf-8"),
+        f"lineage/{masked_case_id}.json": _dump_json(lineage),
+    }
+    if rule_sql is not None:
+        files[f"rules/{rule_id}.sql"] = rule_sql
+    return files
+
+
+def build_case_pack(
+    spec: AMLSpec,
+    case_path: Path,
+    run_dir: Path,
+    *,
+    signing_key: str | None = None,
+) -> bytes:
+    """Per-case evidence pack — the minimum subset to defend one alert.
+
+    Contents:
+    - ``program.md`` — program metadata (same shape as full audit pack)
+    - ``spec_snapshot.yaml`` — copied verbatim from the run when present
+    - ``cases/<case_id>.json`` — the case file itself
+    - ``decisions/<case_id>.jsonl`` — decision sub-chain for this case
+    - ``alerts/<case_id>.jsonl`` — alert payload restricted to this case
+    - ``rules/<rule_id>.sql`` — the SQL that produced the alert (if recorded)
+    - ``lineage/<case_id>.json`` — rule_version + matched_row_ids + inputs
+    - ``manifest.json`` — file-by-file SHA-256 + bundle hash (+ HMAC signature
+      if ``signing_key`` supplied)
+
+    Raises ``FileNotFoundError`` when ``case_path`` is missing.
+    """
+    case = _read_case_file(case_path)
+    all_decisions = _load_decisions(run_dir)
+    pii_map = _load_pii_map(run_dir)
+    files: dict[str, bytes] = {
+        "program.md": _program_md(spec).encode("utf-8"),
+    }
+    spec_snapshot = _read_optional(run_dir, "spec_snapshot.yaml")
+    if spec_snapshot is not None:
+        files["spec_snapshot.yaml"] = spec_snapshot
+    files.update(_case_pack_files(spec, case, run_dir, all_decisions, pii_map))
+    manifest_base = {
+        "pack_version": CASE_PACK_VERSION,
+        "pack_kind": "case",
+        "pii_masked": bool(pii_map),
+        "spec_program": spec.program.name,
+        "spec_jurisdiction": spec.program.jurisdiction,
+        "regulator": spec.program.regulator,
+        # Mask any PII embedded in the compound case_id (Codex P1).
+        "case_id": _mask_compound_string(case.get("case_id", ""), pii_map),
+        "rule_id": case.get("rule_id", ""),
+    }
+    return _assemble_pack(files, manifest_base, signing_key=signing_key)
+
+
+def build_batch_pack(
+    spec: AMLSpec,
+    run_dir: Path,
+    case_ids: list[str],
+    *,
+    signing_key: str | None = None,
+) -> bytes:
+    """Multi-case evidence pack — hand-selected batch for a regulator request.
+
+    ``case_ids`` is the list of ``case_id`` values to include. Each id is
+    matched against ``cases/<case_id>.json`` under ``run_dir``. Missing
+    cases raise ``FileNotFoundError`` — silent skips would let investigators
+    accidentally hand over an incomplete pack. Empty ``case_ids`` raises
+    ``ValueError`` (the caller almost certainly meant to use the full-run
+    audit pack instead).
+    """
+    if not case_ids:
+        raise ValueError("case_ids must not be empty; use build_audit_pack for full runs")
+    # Deduplicate while preserving caller order for the manifest summary.
+    seen: set[str] = set()
+    ordered_ids: list[str] = []
+    for cid in case_ids:
+        if cid not in seen:
+            seen.add(cid)
+            ordered_ids.append(cid)
+
+    cases_dir = run_dir / "cases"
+    cases: list[dict[str, Any]] = []
+    for cid in ordered_ids:
+        path = cases_dir / f"{cid}.json"
+        cases.append(_read_case_file(path))
+
+    all_decisions = _load_decisions(run_dir)
+    pii_map = _load_pii_map(run_dir)
+
+    files: dict[str, bytes] = {
+        "program.md": _program_md(spec).encode("utf-8"),
+    }
+    spec_snapshot = _read_optional(run_dir, "spec_snapshot.yaml")
+    if spec_snapshot is not None:
+        files["spec_snapshot.yaml"] = spec_snapshot
+    for case in cases:
+        files.update(_case_pack_files(spec, case, run_dir, all_decisions, pii_map))
+
+    # Mask any PII embedded in compound case_ids (Codex P1) before
+    # surfacing them in the batch_summary / manifest.
+    masked_ids = sorted({_mask_compound_string(cid, pii_map) for cid in ordered_ids})
+    files["batch_summary.json"] = _dump_json(
+        {
+            "case_count": len(cases),
+            "case_ids": masked_ids,
+            "rules": sorted({c.get("rule_id", "") for c in cases if c.get("rule_id")}),
+        }
+    )
+
+    manifest_base = {
+        "pack_version": CASE_PACK_VERSION,
+        "pack_kind": "batch",
+        "pii_masked": bool(pii_map),
+        "spec_program": spec.program.name,
+        "spec_jurisdiction": spec.program.jurisdiction,
+        "regulator": spec.program.regulator,
+        "case_count": len(cases),
+        "case_ids": masked_ids,
+    }
+    return _assemble_pack(files, manifest_base, signing_key=signing_key)
+
+
 __all__ = [
+    "CASE_PACK_VERSION",
     "PACK_VERSION",
     "SUPPORTED_JURISDICTIONS",
     "build_audit_pack",
     "build_audit_pack_from_run_dir",
+    "build_batch_pack",
+    "build_case_pack",
 ]
