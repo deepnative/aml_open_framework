@@ -282,26 +282,15 @@ class RunRequest(BaseModel):
 # no Streamlit cold-start for the first impression. CTA targets
 # are env-overridable so the same image works across deploys.
 #
-# PR-U4 of the unified-product epic: the Knowledge content
-# (whitepapers + decks + videos) is now fully native in the
-# dashboard via PR-U2's 8 research pages + PR-U3's 2 deck pages
-# (10 Knowledge pages total). `_DEFAULT_KB_URL` now points at the
-# dashboard's `/Architecture` Knowledge entry point — the same
-# content the GH-Pages demo was hosting, served from the
-# canonical product. The GH-Pages site is now superseded and can
-# be retired (operators with a custom `AML_KB_URL` env override
-# keep their pointer).
+# R32: the in-app Knowledge pages (PR-U2/U3, pages 33–42) were
+# retired now that the MkDocs docs site is live. The shared resolver
+# in ``aml_framework.links`` honors both ``AML_DOCS_URL`` (canonical)
+# and ``AML_KB_URL`` (legacy PR-U4 name) — single env knob across
+# api landing, ``/knowledge`` redirect, and dashboard sidebar.
 _STATIC_DIR = Path(__file__).parent / "static"
 _DEFAULT_APP_URL = (
     "https://ca-aml-dashboard-dev.wittyhill-44456789.canadacentral.azurecontainerapps.io"
 )
-# First Knowledge page slug (per app.py's nav order — PR-U2's
-# `33_Knowledge_Architecture.py`). Knowledge defaults are DERIVED
-# from the effective app URL via `_kb_url()` so a deployment
-# that sets `AML_APP_URL` to a non-dev dashboard automatically
-# gets the right KB pointer too; only an explicit `AML_KB_URL`
-# overrides the derivation (Codex P2 round 1 on PR-U4).
-_KB_PATH = "/Architecture"
 
 
 def _app_url() -> str:
@@ -310,14 +299,12 @@ def _app_url() -> str:
 
 
 def _kb_url() -> str:
-    """The Knowledge entry URL. If `AML_KB_URL` is explicitly set,
-    use it. Otherwise derive from the effective app URL so a
-    non-dev deployment's `AML_APP_URL` correctly anchors the
-    Knowledge link (Codex P2 round 1)."""
-    explicit = os.environ.get("AML_KB_URL")
-    if explicit:
-        return explicit
-    return _app_url().rstrip("/") + _KB_PATH
+    """Back-compat alias for ``aml_framework.links.docs_url`` — kept thin
+    so the landing-template substitution + ``/knowledge`` redirect can
+    keep their existing call sites."""
+    from aml_framework.links import docs_url
+
+    return docs_url()
 
 
 @app.get("/", include_in_schema=False)
