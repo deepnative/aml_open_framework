@@ -123,11 +123,40 @@ def _compile_having(having: dict[str, Any]) -> tuple[list[str], list[str]]:
     return select_exprs, preds
 
 
-def compile_rule_sql(rule: Rule, as_of: datetime, source_table: str) -> str:
+def _enrich_join_sql(logic: AggregationWindowLogic, src_alias: str, contracts: dict) -> str:
+    """M4 (#484): as-of JOIN for an aggregation_window `enrich` block. Joins the
+    effective-dated reference contract on the key AND its validity window, so
+    each source row matches the reference row in force at its `booked_at`.
+    `src_alias` is the (already window/filter-narrowed) source subquery alias —
+    pre-filtering the source avoids any column-name ambiguity with the ref."""
+    enr = logic.enrich
+    ref = contracts[enr.contract]
+    ed = ref.effective_dated
+    preds = [
+        f"{src_alias}.{enr.key} = {enr.contract}.{enr.key}",
+        f"{enr.contract}.{ed.valid_from} <= {src_alias}.booked_at",
+    ]
+    if ed.valid_to:
+        preds.append(
+            f"({enr.contract}.{ed.valid_to} IS NULL "
+            f"OR {src_alias}.booked_at < {enr.contract}.{ed.valid_to})"
+        )
+    # Parenthesize each raw `where` predicate so an `OR` inside one can't change
+    # the AND-joined ON-clause precedence.
+    preds.extend(f"({w})" for w in enr.where)
+    on_clause = "\n        AND ".join(preds)
+    return f"JOIN {enr.contract}\n        ON {on_clause}"
+
+
+def compile_rule_sql(
+    rule: Rule, as_of: datetime, source_table: str, contracts: dict | None = None
+) -> str:
     """Return auditable SQL for the rule. Literals inlined, no parameters.
 
     `source_table` is the physical table the contract resolves to in the
     runtime warehouse (e.g. 'txn' in DuckDB, 'raw.transactions' in prod).
+    `contracts` (id -> DataContract) is needed only to resolve an
+    aggregation_window `enrich` as-of join; pass it for point-in-time rules.
     """
     logic = rule.logic
 
@@ -170,12 +199,34 @@ def compile_rule_sql(rule: Rule, as_of: datetime, source_table: str) -> str:
     group_select = ", ".join(logic.group_by)
     agg_selects = ",\n    ".join(having_selects)
 
+    # M4 (#484): when the rule enriches against an effective-dated contract,
+    # pre-filter the source in a base subquery (so the WHERE is single-table —
+    # no column-name ambiguity with the ref) then as-of JOIN. The CTE still
+    # projects `src.*`, so the downstream agg/having logic is unchanged; the
+    # join only narrows the population to the contemporaneous reference rows.
+    if logic.enrich is not None:
+        if contracts is None:
+            raise ValueError(
+                f"rule '{rule.id}' has an `enrich` join but compile_rule_sql was "
+                "called without a `contracts` map — point-in-time SQL cannot be "
+                "built (refusing to emit a non-PIT query that silently ignores it)."
+            )
+        enrich_join = _enrich_join_sql(logic, "src", contracts)
+        filtered_body = (
+            f"SELECT src.*\n"
+            f"    FROM (\n"
+            f"        SELECT * FROM {source_table}\n"
+            f"        WHERE {where_clause}\n"
+            f"    ) AS src\n"
+            f"    {enrich_join}"
+        )
+    else:
+        filtered_body = f"SELECT *\n    FROM {source_table}\n    WHERE {where_clause}"
+
     header = _rule_header(rule, as_of)
     return f"""{header}
 WITH filtered AS (
-    SELECT *
-    FROM {source_table}
-    WHERE {where_clause}
+    {filtered_body}
 ),
 agg AS (
     SELECT
