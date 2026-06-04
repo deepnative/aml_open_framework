@@ -13,7 +13,6 @@ import streamlit as st
 
 from aml_framework.dashboard import golden_thread as gt
 from aml_framework.dashboard.components import (
-    mobile_menu,
     page_footer,
     page_header,
     section_explainer,
@@ -22,27 +21,17 @@ from aml_framework.dashboard.state import ensure_initialized
 
 ensure_initialized()
 
+# Direction-C: suppress the visible eyebrow/title/caption chrome so the
+# ink hero band (injected below on the hero screen) is the FIRST visible
+# block — no doubled "Start here" H1. `render_chrome=False` still mounts
+# the AI-assistant hook and satisfies the page_header source-guard test
+# (same opt-out 0_Today.py uses). The old in-canvas `mobile_menu(...)`
+# ☰ expander is removed: the new persistent bottom tab bar is the mobile
+# nav now, so it was redundant clutter.
 page_header(
     "Start here",
     "An anti-money-laundering program you can show your regulator — without a six-week reconstruction.",
-)
-st.caption(
-    "You write the rules once. It runs them, builds the cases, and keeps a "
-    "tamper-proof record of everything."
-)
-
-# Version-proof phone-nav insurance: an in-canvas page-jump that doesn't
-# depend on the Streamlit sidebar expand control (the native fix is the
-# headline; this is belt-and-braces for thumb-only users).
-mobile_menu(
-    [
-        ("Today", "pages/0_Today.py"),
-        ("Alert Queue", "pages/3_Alert_Queue.py"),
-        ("Investigations", "pages/24_Investigations.py"),
-        ("Audit & Evidence", "pages/7_Audit_Evidence.py"),
-        ("Triage Queue", "pages/52_Triage_Queue.py"),
-        ("Data Quality", "pages/14_Data_Quality.py"),
-    ]
+    render_chrome=False,
 )
 
 
@@ -69,7 +58,41 @@ def _go(i: int) -> None:
 
 
 if idx < 0:
-    # Hero screen: one sentence (header) + one button.
+    # Hero screen — Direction C landing: an ink full-bleed hero band with
+    # reverse-type wordmark + serif H1 (cream, rust *show*), three stat
+    # cards (Rules / Alerts / Cases from the live cached run), then the
+    # rust "Show me it's real" CTA. Injected as HTML so it reads great on
+    # a phone (and acceptably on desktop). The `page_header()` above runs
+    # with `render_chrome=False` (mounts the AI hook + satisfies the
+    # source-guard test, but draws no visible title) so THIS band is the
+    # first visible block — no doubled "Start here" heading.
+    _spec = st.session_state.get("spec")
+    _result = st.session_state.get("result")
+    _n_rules = len(getattr(_spec, "rules", []) or [])
+    _n_alerts = int(getattr(_result, "total_alerts", 0) or 0)
+    _n_cases = len(_records("df_cases"))
+    st.markdown(
+        f"""
+<div class="dna-start-hero">
+  <div class="dna-start-hbar">
+    <span class="dna-start-dot"></span>
+    <span class="dna-start-wordmark">AML Open Framework</span>
+  </div>
+  <h1 class="dna-start-h1">An AML program you can <em>show</em>.</h1>
+  <p class="dna-start-lede">Not just describe — shown to your regulator
+     without a six-week reconstruction.</p>
+</div>
+<div class="dna-start-stats">
+  <div class="dna-start-stat"><div class="dna-start-n">{_n_rules}</div>
+     <div class="dna-start-l">Rules</div></div>
+  <div class="dna-start-stat"><div class="dna-start-n">{_n_alerts}</div>
+     <div class="dna-start-l">Alerts</div></div>
+  <div class="dna-start-stat"><div class="dna-start-n">{_n_cases}</div>
+     <div class="dna-start-l">Cases</div></div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
     st.button("▶  Show me it's real", type="primary", on_click=_go, args=(0,))
     st.page_link("pages/0_Today.py", label="Skip to the app →")
     page_footer()
