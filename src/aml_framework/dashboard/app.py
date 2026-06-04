@@ -60,8 +60,8 @@ logging.getLogger("aml.dashboard").info("Persistence backend: %s", _active_backe
 #
 # The "" (empty-string) section renders flush at the top of the
 # sidebar without a header — the standard Streamlit idiom for
-# "ungrouped, always at the top." Today lives there because it's the
-# personalised landing every persona sees first.
+# "ungrouped, always at the top." Start here is the first-run wizard
+# and default landing; Today is the daily checklist persona sees next.
 #
 # Categories below match the existing tour prose groupings in
 # `docs/dashboard-tour.md` (Operational / Strategic / Engineering /
@@ -69,10 +69,11 @@ logging.getLogger("aml.dashboard").info("Persistence backend: %s", _active_backe
 # category for the PR-DATAVIZ surfaces and "FinTech" as a niche
 # 1-MLRO surface.
 ALL_PAGES: dict[str, list[st.Page]] = {
-    # Welcome + Today are ungrouped above the first category header.
-    # Welcome (page 0) is currently orphaned (on disk, not wired);
-    # only Today is registered here, matching pre-PR-NAV-1 behaviour.
+    # Start here + Today are ungrouped above the first category header.
+    # Start here (page 0) is the first-run wizard and default landing.
+    # Today is the personalised daily checklist every persona sees next.
     "": [
+        st.Page("pages/0_Start.py", title="Start here", icon=":material/play_circle:"),
         st.Page("pages/0_Today.py", title="Today", icon=":material/today:"),
     ],
     "Operations": [
@@ -324,6 +325,8 @@ if selected_audience:
     # "Today" + Executive Dashboard are universal — every persona sees
     # them (Today is the personalised landing; Executive Dashboard is
     # the strategic-view fallback when no persona is selected).
+    # Start is the first-run front door + Replay-tour home — always reachable.
+    relevant_titles.add("Start here")
     relevant_titles.add("Today")
     relevant_titles.add("Executive Dashboard")
     # PR-NS-1: the North-Star pillar coverage page is the cross-cutting

@@ -574,6 +574,45 @@ def test_mobile_css_present_in_dom(_playwright, dashboard_server):
         assert "@media (max-width: 480px)" in html, (
             "Phone-specific CSS overlay missing from injected theme"
         )
+        # The 640px breakpoint carries the mobile-nav carve-out that makes
+        # the collapsed-sidebar expand control tappable (the brand bar no
+        # longer intercepts the tap). Assert both the breakpoint AND the
+        # `.dna-topbar-brand` pointer-events carve-out so a future refactor
+        # can't silently drop the headline phone-nav fix.
+        assert "640px" in html, "mobile nav carve-out media query missing"
+        assert "dna-topbar-brand" in html, "topbar pointer-events carve-out missing"
+    finally:
+        browser.close()
+
+
+# ---------------------------------------------------------------------------
+# Acceptance: a real user can REACH another page on a phone by TAPPING.
+#
+# This is the headline mobile-nav fix. Every other test in this file
+# navigates by typing URL slugs (`_nav_to`) because the fixed
+# `.dna-topbar` brand overlay used to INTERCEPT the tap on Streamlit's
+# collapsed-sidebar expand control — a real user with a thumb (no URL
+# bar) was stranded on the landing page. This test does ONLY what a
+# real user can do: tap the native expand control, then tap a nav link.
+# No URL-slug navigation. It must be tappable (no overlay interception).
+# ---------------------------------------------------------------------------
+
+
+def test_mobile_menu_tap_navigates(_playwright, dashboard_server):
+    """A phone user lands on the default page, TAPS the real sidebar
+    expand control (not a typed URL), then TAPS a nav link to another
+    page — and the route actually changes. Guards against the
+    `.dna-topbar` overlay re-intercepting the collapsed-sidebar control."""
+    browser, page = _open_mobile_page(_playwright, dashboard_server, {"width": 375, "height": 667})
+    try:
+        before = page.url
+        ctrl = page.locator(
+            "[data-testid='stSidebarCollapsedControl'], [data-testid='stExpandSidebarButton']"
+        ).first
+        ctrl.click(timeout=8000)  # must be tappable — no overlay interception
+        page.get_by_role("link", name="Today").first.click(timeout=8000)
+        page.wait_for_function("u => location.href !== u", arg=before, timeout=8000)
+        assert page.url != before, f"phone tap-nav did not change route: stayed on {before}"
     finally:
         browser.close()
 
