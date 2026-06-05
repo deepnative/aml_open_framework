@@ -3670,5 +3670,254 @@ def typology_import_cmd(
     )
 
 
+def _customer_features_from_tables(
+    txns: list[dict], customers: list[dict]
+) -> tuple[list[dict], bool]:
+    """Aggregate the transaction table into per-customer feature rows.
+
+    OFFLINE tooling — this is a triage/proposal lens, NOT the deterministic
+    engine run path. Pure-Python aggregation (no DuckDB needed) keeps the
+    feature math obvious and column-tolerant: a missing column defaults that
+    feature to 0.0 rather than crashing.
+
+    Features per customer:
+      * ``txn_count``            — number of transactions
+      * ``sum_amount``           — sum of ``amount``
+      * ``unique_counterparties``— distinct ``counterparty_id``
+      * ``cross_border_ratio``   — fraction of txns whose
+        ``counterparty_country`` differs from the customer's home
+        ``country``. If neither column is present, this is 0.0 for all
+        customers (and the caller notes it).
+    """
+    home_country = {c.get("customer_id"): c.get("country") for c in customers}
+
+    agg: dict[str, dict] = {}
+    has_xborder = False
+    for txn in txns:
+        cid = txn.get("customer_id")
+        if cid is None:
+            continue
+        row = agg.setdefault(
+            cid,
+            {"txn_count": 0.0, "sum_amount": 0.0, "cps": set(), "xb": 0, "n": 0},
+        )
+        row["txn_count"] += 1.0
+        try:
+            row["sum_amount"] += float(txn.get("amount") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        cp = txn.get("counterparty_id")
+        if cp:
+            row["cps"].add(cp)
+        cc = txn.get("counterparty_country")
+        if cc is not None:
+            has_xborder = True
+            row["n"] += 1
+            home = home_country.get(cid)
+            if home is not None and cc != home:
+                row["xb"] += 1
+
+    features: list[dict] = []
+    for cid, row in agg.items():
+        ratio = (row["xb"] / row["n"]) if row["n"] else 0.0
+        features.append(
+            {
+                "customer_id": cid,
+                "txn_count": row["txn_count"],
+                "sum_amount": row["sum_amount"],
+                "unique_counterparties": float(len(row["cps"])),
+                "cross_border_ratio": ratio,
+            }
+        )
+    return features, has_xborder
+
+
+@app.command(name="discover-typologies")
+def discover_typologies_cmd(
+    spec_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        help="Path to the aml.yaml spec whose data is profiled.",
+    ),
+    run_dir: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        help="Run directory whose alerts/*.jsonl define who is already caught.",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Where to write candidate_typologies.yaml. "
+        "Default: <run_dir>/candidate_typologies.yaml.",
+    ),
+    data_source: str = typer.Option(
+        "synthetic", "--data-source", help="Data source: synthetic|csv|parquet|duckdb."
+    ),
+    data_dir: str | None = typer.Option(
+        None, "--data-dir", help="Directory with CSV/Parquet files."
+    ),
+    seed: int = typer.Option(42, "--seed", help="Seed for the synthetic source."),
+    min_cohort_size: int = typer.Option(
+        3, "--min-cohort-size", help="Smallest cohort that can become a candidate."
+    ),
+    anomaly_z: float = typer.Option(
+        2.0, "--anomaly-z", help="Absolute z-score floor for a feature to count as anomalous."
+    ),
+    as_of: str | None = typer.Option(None, "--as-of", help="ISO timestamp used as the rule 'now'."),
+) -> None:
+    """Discover candidate typologies from the UNEXPLAINED population (#496).
+
+    OFFLINE proposal lens. Loads the spec's data, computes per-customer
+    features, reads the run's alerts to learn who is already caught, then
+    clusters the *uncaught* customers by shared anomalous shape via
+    `engine.typology_discovery.discover_candidates`.
+
+    The output is a set of PROPOSED rule stubs (`status: pending_promotion`)
+    — governance: human-gated, never auto-promoted. Nothing here mutates a
+    spec, fires an alert, or is hashed into the audit ledger. Review the
+    proposals, then `aml typology-import` or edit the spec by hand.
+    """
+    import contextlib
+    import json as _json
+    import os
+    import tempfile
+
+    import yaml
+
+    from aml_framework.data.sources import resolve_source
+    from aml_framework.engine.audit import unmask_alerts
+    from aml_framework.engine.typology_discovery import discover_candidates
+
+    spec = load_spec(spec_path)
+    # Determinism (#496 / codex P1): when `--as-of` is not explicitly passed,
+    # anchor discovery to the run's own `as_of` from <run_dir>/manifest.json so
+    # a re-run against the same run is byte-deterministic. The wall-clock
+    # fallback in `_parse_as_of(None)` only fires if the manifest is missing or
+    # carries no `as_of`. An explicit `--as-of` always overrides.
+    if as_of is not None:
+        as_of_dt = _parse_as_of(as_of)
+    else:
+        manifest_as_of: str | None = None
+        manifest_path = run_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest_as_of = _json.loads(manifest_path.read_bytes()).get("as_of")
+            except (ValueError, OSError):
+                manifest_as_of = None
+        as_of_dt = _parse_as_of(manifest_as_of)
+
+    data = resolve_source(
+        source_type=data_source,
+        spec=spec,
+        as_of=as_of_dt,
+        seed=seed,
+        data_dir=data_dir,
+    )
+    txns = data.get("txn", []) or data.get("transaction", []) or data.get("transactions", [])
+    customers = data.get("customer", []) or data.get("customers", [])
+    if not txns:
+        console.print(
+            "[red]No transaction rows resolved[/red] — expected a "
+            "'txn' (or 'transaction') data contract. Nothing to profile."
+        )
+        raise typer.Exit(code=1)
+
+    features, has_xborder = _customer_features_from_tables(txns, customers)
+    if not has_xborder:
+        console.print(
+            "[yellow]Note:[/yellow] no cross-border/foreign column "
+            "(counterparty_country) in the txn schema — cross_border_ratio "
+            "defaulted to 0.0 for all customers."
+        )
+
+    # Who is already caught? Union of customer_ids across every alert file.
+    # `unmask_alerts` returns {rule_id: [alert, ...]} and is a no-op when the
+    # run wasn't PII-masked, so this is correct for both modes (mirror of
+    # equivalence_cmd's alert read at cli.py:2496-2501).
+    alerts_dir = run_dir / "alerts"
+    if not alerts_dir.exists():
+        console.print(f"[red]No alerts/ in {run_dir}.[/red] Run `aml run` first.")
+        raise typer.Exit(code=1)
+    alerts_by_rule = unmask_alerts(run_dir)
+    alerted_ids = {
+        alert["customer_id"]
+        for rows in alerts_by_rule.values()
+        for alert in rows
+        if alert.get("customer_id") is not None
+    }
+
+    report = discover_candidates(
+        features,
+        alerted_ids,
+        anomaly_z=anomaly_z,
+        min_cohort_size=min_cohort_size,
+    )
+
+    if report.n_candidates == 0:
+        console.print(
+            f"[yellow]No candidate typologies discovered[/yellow] — the "
+            f"unexplained population ({report.n_unexplained} customer(s), "
+            f"{len(alerted_ids)} already caught) shows no shared anomalous "
+            f"shape at z>={anomaly_z}, min cohort {min_cohort_size}. "
+            "No file written."
+        )
+        raise typer.Exit(code=0)
+
+    doc = {
+        "candidates": [
+            {
+                "metadata": {
+                    "discovered_from": run_dir.name,
+                    "size": c.size,
+                    "anomalous_features": c.anomalous_features,
+                    "label": c.label,
+                },
+                "rule": c.suggested_rule,
+            }
+            for c in report.candidates
+        ]
+    }
+
+    out_path = output if output is not None else run_dir / "candidate_typologies.yaml"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write (codex P1): render to a temp file in the SAME directory then
+    # os.replace, so an I/O error never leaves a partial candidate_typologies.yaml.
+    rendered = yaml.safe_dump(doc, sort_keys=False)
+    fd, tmp_name = tempfile.mkstemp(dir=out_path.parent, prefix=out_path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(rendered)
+        os.replace(tmp_name, out_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+    console.rule(f"[bold cyan]✓ Wrote {out_path}[/bold cyan]")
+    table = Table(title="Candidate typologies (proposals)")
+    table.add_column("label")
+    table.add_column("size", justify="right")
+    table.add_column("anomalous_features")
+    for c in report.candidates:
+        table.add_row(c.label, str(c.size), ", ".join(c.anomalous_features))
+    console.print(table)
+    console.print(
+        f"  {report.n_candidates} candidate(s) over "
+        f"{report.n_unexplained} unexplained customer(s) "
+        f"({len(alerted_ids)} already caught)."
+    )
+    console.print(
+        "\n[bold yellow]Governance:[/bold yellow] these are PROPOSALS "
+        "([cyan]status: pending_promotion[/cyan]). Review, then "
+        "[cyan]aml typology-import[/cyan] or edit the spec by hand; "
+        "nothing auto-promotes to a live rule."
+    )
+
+
 if __name__ == "__main__":
     app()
