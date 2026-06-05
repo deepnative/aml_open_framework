@@ -304,6 +304,27 @@ class RiskSegmentation(_Base):
     segments: list[RiskSegment] = Field(default_factory=list)
 
 
+class ModelRiskMonitoring(_Base):
+    """Governed model-risk monitoring config (SR 11-7 / OSFI E-23).
+
+    When `enabled`, the engine emits a frozen, manifest-pinned
+    `model_risk_report.json` rolling the model inventory + per-rule
+    count-based drift (vs the prior run) + validation-cadence status.
+    Advisory/monitoring only — never blocks a run or changes a model.
+    Off by default; backward-compatible.
+
+    `baseline_runs` is RESERVED for a future multi-run baseline; the MVP
+    compares against the immediately-prior run only and does not consume
+    this field yet.
+    """
+
+    enabled: bool = False
+    drift_high_ratio: float = Field(default=2.0, ge=1.0, allow_inf_nan=False)
+    # RESERVED — a future multi-run baseline will consider this many prior
+    # runs. The current MVP compares against the immediately-prior run only.
+    baseline_runs: int = Field(default=10, ge=1)
+
+
 class Program(_Base):
     name: str
     jurisdiction: str
@@ -343,6 +364,10 @@ class Program(_Base):
     # declared low-risk segments — never alters disposition/queue/state.
     # Default None = segmentation disabled.
     risk_segmentation: RiskSegmentation | None = None
+    # feat(spec) #497: optional governed model-risk monitoring config.
+    # See `ModelRiskMonitoring`. When enabled, the engine emits a frozen,
+    # manifest-pinned `model_risk_report.json`. Default None = disabled.
+    model_risk_monitoring: ModelRiskMonitoring | None = None
     # PR-D3 (#376): environment promotion lane this spec is running in.
     # Defaults to `dev` so existing specs validate unchanged. The engine
     # WARNs (and, with `strict_environment_gating`, raises) when a rule
